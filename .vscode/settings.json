@@ -1,9 +1,14 @@
 {
-    "cSpell.words": [
-        "Backtest",
-        "binancefutures",
-        "hftbacktest",
-        "njit"
-    ],
-    "vscode-pydata-viewer.pythonPath": "C:\\Users\\81393\\miniconda3\\envs\\hfbacktest\\python.exe"
+  "cSpell.words": [
+    "Backtest",
+    "binancefutures",
+    "btcusdt",
+    "hftbacktest",
+    "njit",
+    "solusdt"
+  ],
+  "vscode-pydata-viewer.pythonPath": "C:\\Users\\81393\\miniconda3\\envs\\hfbacktest\\python.exe",
+  "python-envs.defaultEnvManager": "ms-python.python:conda",
+  "python-envs.defaultPackageManager": "ms-python.python:conda",
+  "python-envs.pythonProjects": []
 }
