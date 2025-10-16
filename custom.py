@@ -544,7 +544,7 @@ def objective(trial: optuna.Trial = None):
     try:
         stats, qty_mean = test(cfg)
     except Exception as e:
-        return 0,0,0
+        return -1e1,-1e5,-1e1
     return stats.splits[0]['Return'] * 1e4, -abs(qty_mean), -stats.splits[0]['MaxDrawdown'] * 1e4
 
 
