@@ -1,3 +1,5 @@
+import time
+
 import numpy as np
 
 from numba import njit, uint64
@@ -31,24 +33,24 @@ class Config:
     # 做市规模/订单管理
     baseOrderQty: float = 2
     maxOrdersPerSide: int = 2
-    repriceThresholdBps: float = 1.5
+    repriceThresholdBps: float = 7.68
     cancelThrottleMs: int = 400
-    queueSizeAheadPctLimit: float = 0.35
+    queueSizeAheadPctLimit: float = 7.18
     queueBumpTicks: int = 1
 
     # Alpha / 价心偏移
     obiDepth: int = 5
-    obiWeight: float = 0.8
-    bpLookback: int = 12
-    bpWeight: float = 0.4
-    micropriceWeight: float = 0.6
-    alphaToPriceBps: float = 3.0
+    obiWeight: float = 0.59
+    bpLookback: int = 8
+    bpWeight: float = 3.94
+    micropriceWeight: float = 0.684
+    alphaToPriceBps: float = 9.42
 
     # AS 工业化参数
-    riskAversionGamma: float = 0.1
-    baseHalfSpreadBps: float = 2.0
-    volHalfSpreadK: float = 0.25
-    inventorySkewK: float = 0.4
+    riskAversionGamma: float = 0.02
+    baseHalfSpreadBps: float = 0.4
+    volHalfSpreadK: float = 4.37
+    inventorySkewK: float = 0.814
 
 
     # 波动率窗口（秒）
@@ -177,6 +179,8 @@ def compute_alpha(mid: float,
     bp = barportion_avg(bpLookback, bar_o, bar_h, bar_l, bar_c, bar_cnt) - 0.5
     micro = microprice_from_top(depth.best_bid, depth.best_bid_qty,
                                 depth.best_ask, depth.best_ask_qty)
+    if mid == 0.0:
+        print("mid",mid)
     microShiftBps = ((micro - mid) / mid) * 1e4 if mid > 0 else 0.0
     centerShift = alphaToBps * (obiW * obi + bpW * bp + microW * (microShiftBps / 10.0))
     skew = obiW * obi + bpW * bp
@@ -281,6 +285,8 @@ def strategy(hbt,stat,cfg:Config):
 
     # 事件主循环：每 step_ns 检查一次
     while hbt.elapse(step_ns) == 0:
+        print("---------")
+        t1 = time.perf_counter_ns()
         hbt.clear_inactive_orders(asset_no)
         ts = hbt.current_timestamp
 
@@ -292,6 +298,9 @@ def strategy(hbt,stat,cfg:Config):
 
         mid = 0.5 * (best_bid + best_ask)
         push_mid(ts, mid)
+
+        t2 = time.perf_counter_ns()
+
 
         # 用 market trades 更新 1m bars（若无成交，以 mid 兜底）
         last_trades = hbt.last_trades(asset_no)
@@ -314,6 +323,7 @@ def strategy(hbt,stat,cfg:Config):
         if ts - last_reconcile_ts < np.int64(cfg.test_interval_ms * 0.8) * 1_000_000:
             continue
         last_reconcile_ts = ts
+        t3 = time.perf_counter_ns()
 
         # 波动尺度
         vol_scale = vol_scale_from_mids(mids, mids_ts, mid_cnt, vol_lookback_ns)
@@ -334,6 +344,7 @@ def strategy(hbt,stat,cfg:Config):
             bid_raw, ask_raw, halfBps = compute_quotes_AS(mid, depth, vol_scale, centerShiftBps, skewAlpha, invSkew,riskAversionGamma=cfg.riskAversionGamma,baseHalfSpreadBps=cfg.baseHalfSpreadBps,volHalfSpreadK=cfg.volHalfSpreadK)
         else:
             bid_raw, ask_raw, halfBps = compute_quotes_GLFT(mid, depth, vol_scale, invSkew,cfg=cfg)
+        t4 = time.perf_counter_ns()
 
         bid = floor_to_tick(bid_raw, tick)
         ask = ceil_to_tick(ask_raw, tick)
@@ -360,6 +371,8 @@ def strategy(hbt,stat,cfg:Config):
         orders = hbt.orders(asset_no)
         need_cancel_id = np.int64(0)
         order_values= orders.values()
+        t5 = time.perf_counter_ns()
+
         while order_values.has_next():
             o = order_values.get()
             # 如果订单价不在计划集里，或需要 bump，则考虑撤销
@@ -411,10 +424,11 @@ def strategy(hbt,stat,cfg:Config):
                     if desired_first != 0.0 and bps_distance(bump_px, desired_first) <= cfg.repriceThresholdBps * 3.0:
                         need_cancel_id = o.order_id
                         break
+        t6 = time.perf_counter_ns()
 
         # 撤单节流：如需撤且距离上次撤单已超过阈值 -> 撤第一个并本轮不补
         if need_cancel_id != 0 and (ts - last_cancel_ts) > cancel_throttle_ns:
-            res = hbt.cancel(asset_no, need_cancel_id, True)
+            hbt.cancel(asset_no, need_cancel_id, True)
             last_cancel_ts = ts
             # 与 TS 一致：本轮直接 return（下一轮再补）
             # 等效为：继续下一 tick
@@ -438,15 +452,16 @@ def strategy(hbt,stat,cfg:Config):
             else:
                 hbt.submit_sell_order(asset_no, next_oid, px, qty, GTX, LIMIT, True)
             next_oid += 1
+        t7 = time.perf_counter_ns()
+        print(t2-t1,t3-t2,t4-t3,t5-t4,t6-t5,t7-t6)
         stat.record(hbt)
 
-
 data = np.concatenate(
-[np.load('data\\binance_spot\\solfdusd_{}.npz'.format(date))['data'] for date in [20251011, 20251012, 20251013]]
+[np.load('data\\binance_spot\\solfdusd_{}.npz'.format(date))['data'] for date in [ 20251015]]
 )
-initial_snapshot = np.load('data\\binance_spot\\solfdusd_20251010_eod.npz')['data']
+initial_snapshot = np.load('data\\binance_spot\\solfdusd_20251014_eod.npz')['data']
 latency_data = np.concatenate(
-[np.load('data\\binance_spot\\solfdusd_{}_latency.npz'.format(date))['data'] for date in [20251011, 20251012, 20251013]]
+[np.load('data\\binance_spot\\solfdusd_{}_latency.npz'.format(date))['data'] for date in [20251015]]
 )
 
 def test(cfg):
@@ -478,51 +493,55 @@ def test(cfg):
 
     hbt.close()
     stats = LinearAssetRecord(recorder.get(0)).stats(book_size=10_000_000)
+
+    stats.plot().savefig(f'mm-custom-30m-returns{stats.splits[0]['Return']}-drawdown{stats.splits[0]['MaxDrawdown']}.png')
     return stats
 
 
 
+test(CFG)
+print(CFG)
 
 
-from dataclasses import asdict
-# pip install optuna numpy pandas
-import optuna, numpy as np, pandas as pd
-from optuna.trial import TrialState
-def objective(trial: optuna.Trial = None):
-    # 创建配置副本以避免修改原始配置
-    cfg = copy.deepcopy(CFG)
-
-    # 定义要优化的参数范围
-    # AS 工业化参数
-    cfg.baseHalfSpreadBps = trial.suggest_float("baseHalfSpreadBps", 0.1, 2.0)
-    cfg.riskAversionGamma = trial.suggest_float("riskAversionGamma", 0.01, 1.0)
-    cfg.volHalfSpreadK = trial.suggest_float("volHalfSpreadK", 0.01, 10)
-    cfg.inventorySkewK = trial.suggest_float("inventorySkewK", 0.01, 10)
-
-
-
-    # Alpha / 价心偏移
-    cfg.obiWeight = trial.suggest_float("obiWeight", 0.01, 5.0)
-    cfg.bpLookback = trial.suggest_int("bpLookback", 0.01, 10)
-    cfg.bpWeight = trial.suggest_float("bpWeight", 0.001, 5.0)
-    cfg.micropriceWeight = trial.suggest_float("micropriceWeight", 0.01, 1.0)
-    cfg.alphaToPriceBps = trial.suggest_float("alphaToPriceBps", 0.01, 10.0)
-
-    # 做市规模/订单管理
-    cfg.repriceThresholdBps = trial.suggest_float("repriceThresholdBps", 0.01, 10.0)
-    cfg.queueSizeAheadPctLimit = trial.suggest_float("queueSizeAheadPctLimit", 0.01, 10)
-
-    # 设置用户属性以便后续分析
-    for key, value in asdict(cfg).items():
-        trial.set_user_attr(key, value)
-
-    stats = test(cfg)
-    return stats.splits[0]['Return'] * 1e4, stats.splits[0]['DailyNumberOfTrades'], -stats.splits[0]['MaxDrawdown'] * 1e4
-
-
-# 优化
-study = optuna.load_study(study_name="mm-custom-30m",storage= "mysql://optuna:AyHfbtAyAiRjR4ck@47.86.7.11/optuna")
-study.optimize(objective, n_trials=int(3 * 1e3), n_jobs=1)
+# from dataclasses import asdict
+# # pip install optuna numpy pandas
+# import optuna, numpy as np, pandas as pd
+# from optuna.trial import TrialState
+# def objective(trial: optuna.Trial = None):
+#     # 创建配置副本以避免修改原始配置
+#     cfg = copy.deepcopy(CFG)
+#
+#     # 定义要优化的参数范围
+#     # AS 工业化参数
+#     cfg.baseHalfSpreadBps = trial.suggest_float("baseHalfSpreadBps", 0.1, 2.0)
+#     cfg.riskAversionGamma = trial.suggest_float("riskAversionGamma", 0.01, 1.0)
+#     cfg.volHalfSpreadK = trial.suggest_float("volHalfSpreadK", 0.01, 10)
+#     cfg.inventorySkewK = trial.suggest_float("inventorySkewK", 0.01, 10)
+#
+#
+#
+#     # Alpha / 价心偏移
+#     cfg.obiWeight = trial.suggest_float("obiWeight", 0.01, 5.0)
+#     cfg.bpLookback = trial.suggest_int("bpLookback", 0.01, 10)
+#     cfg.bpWeight = trial.suggest_float("bpWeight", 0.001, 5.0)
+#     cfg.micropriceWeight = trial.suggest_float("micropriceWeight", 0.01, 1.0)
+#     cfg.alphaToPriceBps = trial.suggest_float("alphaToPriceBps", 0.01, 10.0)
+#
+#     # 做市规模/订单管理
+#     cfg.repriceThresholdBps = trial.suggest_float("repriceThresholdBps", 0.01, 10.0)
+#     cfg.queueSizeAheadPctLimit = trial.suggest_float("queueSizeAheadPctLimit", 0.01, 10)
+#
+#     # 设置用户属性以便后续分析
+#     for key, value in asdict(cfg).items():
+#         trial.set_user_attr(key, value)
+#
+#     stats = test(cfg)
+#     return stats.splits[0]['Return'] * 1e4, stats.splits[0]['DailyNumberOfTrades'], -stats.splits[0]['MaxDrawdown'] * 1e4
+#
+#
+# # 优化
+# study = optuna.load_study(study_name="mm-custom-30m",storage= "mysql://optuna:AyHfbtAyAiRjR4ck@47.86.7.11/optuna")
+# study.optimize(objective, n_trials=int(3 * 1e3), n_jobs=1)
 
 
 
