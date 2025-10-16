@@ -115,7 +115,6 @@ def obi_mm(
 
                 # order price in tick is used as order id.
                 new_bid_orders[uint64(bid_price_tick)] = bid_price
-
                 bid_price -= grid_interval
 
         # Creates a new grid for sell orders.
@@ -188,20 +187,20 @@ def objective(trial:optuna.Trial = None):
     hbt = ROIVectorMarketDepthBacktest([asset])
     recorder = Recorder(1, 30_000_000)
 
-    half_spread = 1.4
-    skew = 1.0
-    c1 = 375.8
-    depth = 0.098  # 2.5% from the mid price
+    half_spread = 0.1
+    skew = 0.538
+    c1 = 0.2
+    depth = 0.099  # 2.5% from the mid price
     interval = 1_000_000_000  # 1s
-    window =  3600 * interval  # 1hour
+    window =  60 * interval  # 1hour
     order_qty_dollar = 5000
     max_position_dollar = order_qty_dollar * 50
     grid_num = 1
     grid_interval = hbt.depth(0).tick_size
 
-    half_spread = trial.suggest_float("half_spread", 0.001, 10)
-    skew = trial.suggest_float("skew", 0.0001, 10)
-    c1 = trial.suggest_float("c1", 0.1, 200)
+    half_spread = trial.suggest_float("half_spread", 0.001, 1)
+    skew = trial.suggest_float("skew", 0.001, 1)
+    c1 = trial.suggest_float("c1", 0.01, 2)
     depth = trial.suggest_float("depth", 1/1e4, 1/1e1)
 
     obi_mm(
@@ -223,14 +222,14 @@ def objective(trial:optuna.Trial = None):
     hbt.close()
 
     stats = LinearAssetRecord(recorder.get(0)).stats(book_size=10_000_000)
-    # stats.plot().savefig("obi_mm.png")
     # 返回万分之
     return stats.splits[0]['Return'] * 1e4, stats.splits[0]['DailyNumberOfTrades'], -stats.splits[0]['MaxDrawdown'] * 1e4
 
 
 
 
-study = optuna.load_study(study_name="mm-obi",storage= "mysql://optuna:AyHfbtAyAiRjR4ck@47.86.7.11/optuna")
+study = optuna.load_study(study_name="mm-obi-1m",storage= "mysql://optuna:AyHfbtAyAiRjR4ck@47.86.7.11/optuna")
 study.optimize(objective, n_trials=int(3 * 1e3), n_jobs=1)
+
 
 
