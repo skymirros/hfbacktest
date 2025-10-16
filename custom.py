@@ -1,13 +1,10 @@
 import time
-
 import numpy as np
-
 from numba import njit, uint64
 from numba.typed import Dict
 from hftbacktest.stats import LinearAssetRecord
 from dataclasses import dataclass
-
-
+from typing import Tuple
 from hftbacktest import (
     BacktestAsset,
     ROIVectorMarketDepthBacktest,
@@ -20,7 +17,6 @@ from hftbacktest import (
     Recorder
 )
 from hftbacktest.stats import LinearAssetRecord
-
 import copy
 
 @dataclass
@@ -28,7 +24,7 @@ class Config:
     # 资产与数据
     symbol: str = "SOLUSDT"
     engine: str = "AS"
-    test_interval_ms: int = 1000  # 主循环节拍（≈ quoteRefreshMs）
+    test_interval_ms: int = 2000  # 主循环节拍（≈ quoteRefreshMs）
 
     # 做市规模/订单管理
     baseOrderQty: float = 2
@@ -91,11 +87,29 @@ def microprice_from_top(bid_px: float, bid_qty: float, ask_px: float, ask_qty: f
 def minute_index_from_ns(ts_ns: np.int64) -> np.int64:
     return ts_ns // np.int64(60_000_000_000)  # 60s -> ns
 
+class StreamingMean:
+    """高精度流式平均值（Neumaier补偿求和，避免浮点误差累积）"""
+    __slots__ = ("n", "_sum", "_comp")
 
+    def __init__(self):
+        self.n = 0
+        self._sum = 0.0
+        self._comp = 0.0  # 误差补偿
 
+    def push(self, x: float):
+        self.n += 1
+        t = self._sum + x
+        # Neumaier compensation
+        if abs(self._sum) >= abs(x):
+            self._comp += (self._sum - t) + x
+        else:
+            self._comp += (x - t) + self._sum
+        self._sum = t
 
+    @property
+    def mean(self) -> float:
+        return 0.0 if self.n == 0 else (self._sum + self._comp) / self.n
 
-from typing import Tuple
 
 
 @njit
@@ -179,8 +193,6 @@ def compute_alpha(mid: float,
     bp = barportion_avg(bpLookback, bar_o, bar_h, bar_l, bar_c, bar_cnt) - 0.5
     micro = microprice_from_top(depth.best_bid, depth.best_bid_qty,
                                 depth.best_ask, depth.best_ask_qty)
-    if mid == 0.0:
-        print("mid",mid)
     microShiftBps = ((micro - mid) / mid) * 1e4 if mid > 0 else 0.0
     centerShift = alphaToBps * (obiW * obi + bpW * bp + microW * (microShiftBps / 10.0))
     skew = obiW * obi + bpW * bp
@@ -234,6 +246,10 @@ def strategy(hbt,stat,cfg:Config):
     mids_ts = np.zeros(MID_MAX, np.int64)
     mid_cnt = 0
 
+    # 自定义指标
+
+    avg = StreamingMean()
+
     def push_mid(ts_ns: np.int64, m: float):
         nonlocal mid_cnt
         if mid_cnt < MID_MAX:
@@ -285,8 +301,6 @@ def strategy(hbt,stat,cfg:Config):
 
     # 事件主循环：每 step_ns 检查一次
     while hbt.elapse(step_ns) == 0:
-        print("---------")
-        t1 = time.perf_counter_ns()
         hbt.clear_inactive_orders(asset_no)
         ts = hbt.current_timestamp
 
@@ -298,9 +312,6 @@ def strategy(hbt,stat,cfg:Config):
 
         mid = 0.5 * (best_bid + best_ask)
         push_mid(ts, mid)
-
-        t2 = time.perf_counter_ns()
-
 
         # 用 market trades 更新 1m bars（若无成交，以 mid 兜底）
         last_trades = hbt.last_trades(asset_no)
@@ -315,6 +326,9 @@ def strategy(hbt,stat,cfg:Config):
         # 风控：净仓位（quote 计）= position * mid
         pos = hbt.position(asset_no)
         net_quote = pos * mid
+
+        avg.push(net_quote)
+
         if np.abs(net_quote) > cfg.maxNetPosQuote:
             # 超限本轮不报价
             continue
@@ -323,7 +337,6 @@ def strategy(hbt,stat,cfg:Config):
         if ts - last_reconcile_ts < np.int64(cfg.test_interval_ms * 0.8) * 1_000_000:
             continue
         last_reconcile_ts = ts
-        t3 = time.perf_counter_ns()
 
         # 波动尺度
         vol_scale = vol_scale_from_mids(mids, mids_ts, mid_cnt, vol_lookback_ns)
@@ -344,7 +357,6 @@ def strategy(hbt,stat,cfg:Config):
             bid_raw, ask_raw, halfBps = compute_quotes_AS(mid, depth, vol_scale, centerShiftBps, skewAlpha, invSkew,riskAversionGamma=cfg.riskAversionGamma,baseHalfSpreadBps=cfg.baseHalfSpreadBps,volHalfSpreadK=cfg.volHalfSpreadK)
         else:
             bid_raw, ask_raw, halfBps = compute_quotes_GLFT(mid, depth, vol_scale, invSkew,cfg=cfg)
-        t4 = time.perf_counter_ns()
 
         bid = floor_to_tick(bid_raw, tick)
         ask = ceil_to_tick(ask_raw, tick)
@@ -371,7 +383,6 @@ def strategy(hbt,stat,cfg:Config):
         orders = hbt.orders(asset_no)
         need_cancel_id = np.int64(0)
         order_values= orders.values()
-        t5 = time.perf_counter_ns()
 
         while order_values.has_next():
             o = order_values.get()
@@ -424,7 +435,6 @@ def strategy(hbt,stat,cfg:Config):
                     if desired_first != 0.0 and bps_distance(bump_px, desired_first) <= cfg.repriceThresholdBps * 3.0:
                         need_cancel_id = o.order_id
                         break
-        t6 = time.perf_counter_ns()
 
         # 撤单节流：如需撤且距离上次撤单已超过阈值 -> 撤第一个并本轮不补
         if need_cancel_id != 0 and (ts - last_cancel_ts) > cancel_throttle_ns:
@@ -452,16 +462,17 @@ def strategy(hbt,stat,cfg:Config):
             else:
                 hbt.submit_sell_order(asset_no, next_oid, px, qty, GTX, LIMIT, True)
             next_oid += 1
-        t7 = time.perf_counter_ns()
-        print(t2-t1,t3-t2,t4-t3,t5-t4,t6-t5,t7-t6)
         stat.record(hbt)
 
+    return avg.mean
+
+
 data = np.concatenate(
-[np.load('data\\binance_spot\\solfdusd_{}.npz'.format(date))['data'] for date in [ 20251015]]
+[np.load('data\\binance_spot\\solfdusd_{}.npz'.format(date))['data'] for date in [20251011,20251012,20251013]]
 )
-initial_snapshot = np.load('data\\binance_spot\\solfdusd_20251014_eod.npz')['data']
+initial_snapshot = np.load('data\\binance_spot\\solfdusd_20251010_eod.npz')['data']
 latency_data = np.concatenate(
-[np.load('data\\binance_spot\\solfdusd_{}_latency.npz'.format(date))['data'] for date in [20251015]]
+[np.load('data\\binance_spot\\solfdusd_{}_latency.npz'.format(date))['data'] for date in [20251011,20251012,20251013]]
 )
 
 def test(cfg):
@@ -488,60 +499,58 @@ def test(cfg):
 
     recorder = Recorder(1, 30_000_000)
 
-    strategy(hbt,recorder.recorder,cfg)
+    qty_mean = strategy(hbt,recorder.recorder,cfg)
 
 
     hbt.close()
     stats = LinearAssetRecord(recorder.get(0)).stats(book_size=10_000_000)
 
-    stats.plot().savefig(f'mm-custom-30m-returns{stats.splits[0]['Return']}-drawdown{stats.splits[0]['MaxDrawdown']}.png')
-    return stats
+    return stats, qty_mean
 
 
 
-test(CFG)
-print(CFG)
+
+from dataclasses import asdict
+# pip install optuna numpy pandas
+import optuna, numpy as np, pandas as pd
+from optuna.trial import TrialState
+def objective(trial: optuna.Trial = None):
+    # 创建配置副本以避免修改原始配置
+    cfg = copy.deepcopy(CFG)
+
+    # 定义要优化的参数范围
+    # AS 工业化参数
+    cfg.baseHalfSpreadBps = trial.suggest_float("baseHalfSpreadBps", 0.1, 2.0)
+    cfg.riskAversionGamma = trial.suggest_float("riskAversionGamma", 0.01, 2.0)
+    cfg.volHalfSpreadK = trial.suggest_float("volHalfSpreadK", 0.01, 10)
+    cfg.inventorySkewK = trial.suggest_float("inventorySkewK", 0.01, 10)
 
 
-# from dataclasses import asdict
-# # pip install optuna numpy pandas
-# import optuna, numpy as np, pandas as pd
-# from optuna.trial import TrialState
-# def objective(trial: optuna.Trial = None):
-#     # 创建配置副本以避免修改原始配置
-#     cfg = copy.deepcopy(CFG)
-#
-#     # 定义要优化的参数范围
-#     # AS 工业化参数
-#     cfg.baseHalfSpreadBps = trial.suggest_float("baseHalfSpreadBps", 0.1, 2.0)
-#     cfg.riskAversionGamma = trial.suggest_float("riskAversionGamma", 0.01, 1.0)
-#     cfg.volHalfSpreadK = trial.suggest_float("volHalfSpreadK", 0.01, 10)
-#     cfg.inventorySkewK = trial.suggest_float("inventorySkewK", 0.01, 10)
-#
-#
-#
-#     # Alpha / 价心偏移
-#     cfg.obiWeight = trial.suggest_float("obiWeight", 0.01, 5.0)
-#     cfg.bpLookback = trial.suggest_int("bpLookback", 0.01, 10)
-#     cfg.bpWeight = trial.suggest_float("bpWeight", 0.001, 5.0)
-#     cfg.micropriceWeight = trial.suggest_float("micropriceWeight", 0.01, 1.0)
-#     cfg.alphaToPriceBps = trial.suggest_float("alphaToPriceBps", 0.01, 10.0)
-#
-#     # 做市规模/订单管理
-#     cfg.repriceThresholdBps = trial.suggest_float("repriceThresholdBps", 0.01, 10.0)
-#     cfg.queueSizeAheadPctLimit = trial.suggest_float("queueSizeAheadPctLimit", 0.01, 10)
-#
-#     # 设置用户属性以便后续分析
-#     for key, value in asdict(cfg).items():
-#         trial.set_user_attr(key, value)
-#
-#     stats = test(cfg)
-#     return stats.splits[0]['Return'] * 1e4, stats.splits[0]['DailyNumberOfTrades'], -stats.splits[0]['MaxDrawdown'] * 1e4
-#
-#
-# # 优化
-# study = optuna.load_study(study_name="mm-custom-30m",storage= "mysql://optuna:AyHfbtAyAiRjR4ck@47.86.7.11/optuna")
-# study.optimize(objective, n_trials=int(3 * 1e3), n_jobs=1)
+
+    # Alpha / 价心偏移
+    cfg.obiWeight = trial.suggest_float("obiWeight", 0.001, 5.0,)
+    cfg.bpLookback = trial.suggest_int("bpLookback", 0.001, 10)
+    cfg.bpWeight = trial.suggest_float("bpWeight", 0.001, 5.0)
+    cfg.micropriceWeight = trial.suggest_float("micropriceWeight", 0.001, 1.0)
+    cfg.alphaToPriceBps = trial.suggest_float("alphaToPriceBps", 0.001, 10.0)
+
+    # 做市规模/订单管理
+    cfg.repriceThresholdBps = trial.suggest_float("repriceThresholdBps", 0.01, 10.0)
+    cfg.queueSizeAheadPctLimit = trial.suggest_float("queueSizeAheadPctLimit", 0.01, 10)
+
+    # 设置用户属性以便后续分析
+    for key, value in asdict(cfg).items():
+        trial.set_user_attr(key, value)
+    try:
+        stats, qty_mean = test(cfg)
+    except Exception as e:
+        return 0,0,0
+    return stats.splits[0]['Return'] * 1e4, -abs(qty_mean), -stats.splits[0]['MaxDrawdown'] * 1e4
+
+
+# 优化
+study = optuna.load_study(study_name="mm-custom-30m-2",storage= "mysql://optuna:AyHfbtAyAiRjR4ck@47.86.7.11/optuna")
+study.optimize(objective, n_trials=int(3 * 1e3), n_jobs=1)
 
 
 
