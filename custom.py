@@ -21,34 +21,6 @@ from hftbacktest.stats import LinearAssetRecord
 
 import copy
 
-
-
-@njit
-def floor_to_tick(px: float, tick: float) -> float:
-    return np.floor(px / tick) * tick
-
-@njit
-def ceil_to_tick(px: float, tick: float) -> float:
-    return np.ceil(px / tick) * tick
-
-@njit
-def bps_distance(a: float, b: float) -> float:
-    if b == 0.0:
-        return 0.0
-    return np.abs((a - b) / b) * 1e4
-
-@njit
-def microprice_from_top(bid_px: float, bid_qty: float, ask_px: float, ask_qty: float) -> float:
-    denom = bid_qty + ask_qty
-    if denom <= 0.0:
-        return (bid_px + ask_px) * 0.5
-    return (ask_px * bid_qty + bid_px * ask_qty) / denom
-
-@njit
-def minute_index_from_ns(ts_ns: np.int64) -> np.int64:
-    return ts_ns // np.int64(60_000_000_000)  # 60s -> ns
-
-
 @dataclass
 class Config:
     # 资产与数据
@@ -91,6 +63,34 @@ class Config:
     takerFee: float = 0.0007     # 示例费率：taker 付费
 
 CFG = Config()
+
+@njit
+def floor_to_tick(px: float, tick: float) -> float:
+    return np.floor(px / tick) * tick
+
+@njit
+def ceil_to_tick(px: float, tick: float) -> float:
+    return np.ceil(px / tick) * tick
+
+@njit
+def bps_distance(a: float, b: float) -> float:
+    if b == 0.0:
+        return 0.0
+    return np.abs((a - b) / b) * 1e4
+
+@njit
+def microprice_from_top(bid_px: float, bid_qty: float, ask_px: float, ask_qty: float) -> float:
+    denom = bid_qty + ask_qty
+    if denom <= 0.0:
+        return (bid_px + ask_px) * 0.5
+    return (ask_px * bid_qty + bid_px * ask_qty) / denom
+
+@njit
+def minute_index_from_ns(ts_ns: np.int64) -> np.int64:
+    return ts_ns // np.int64(60_000_000_000)  # 60s -> ns
+
+
+
 
 
 from typing import Tuple
@@ -442,16 +442,16 @@ def strategy(hbt,stat,cfg:Config):
 
 
 data = np.concatenate(
-[np.load('data\\binance_spot\\solfdusd_{}.npz'.format(date))['data'] for date in [20251011,20251012,20251013]]
+[np.load('data\\binance_spot\\solfdusd_{}.npz'.format(date))['data'] for date in [20251011, 20251012, 20251013]]
 )
 initial_snapshot = np.load('data\\binance_spot\\solfdusd_20251010_eod.npz')['data']
 latency_data = np.concatenate(
-[np.load('data\\binance_spot\\solfdusd_{}_latency.npz'.format(date))['data'] for date in [20251011,20251012,20251013]]
+[np.load('data\\binance_spot\\solfdusd_{}_latency.npz'.format(date))['data'] for date in [20251011, 20251012, 20251013]]
 )
 
 def test(cfg):
     roi_lb = 50
-    roi_ub = 5000
+    roi_ub = 500
 
 
     asset = (
@@ -478,8 +478,7 @@ def test(cfg):
 
     hbt.close()
     stats = LinearAssetRecord(recorder.get(0)).stats(book_size=10_000_000)
-    return stats.splits[0]['Return'], stats.splits[0]['MaxDrawdown']
-
+    return stats
 
 
 
@@ -489,13 +488,13 @@ from dataclasses import asdict
 # pip install optuna numpy pandas
 import optuna, numpy as np, pandas as pd
 from optuna.trial import TrialState
-def objective(trial: optuna.Trial):
+def objective(trial: optuna.Trial = None):
     # 创建配置副本以避免修改原始配置
     cfg = copy.deepcopy(CFG)
 
     # 定义要优化的参数范围
     # AS 工业化参数
-    cfg.baseHalfSpreadBps = trial.suggest_float("baseHalfSpreadBps", 0.1, 10.0)
+    cfg.baseHalfSpreadBps = trial.suggest_float("baseHalfSpreadBps", 0.1, 2.0)
     cfg.riskAversionGamma = trial.suggest_float("riskAversionGamma", 0.01, 1.0)
     cfg.volHalfSpreadK = trial.suggest_float("volHalfSpreadK", 0.01, 10)
     cfg.inventorySkewK = trial.suggest_float("inventorySkewK", 0.01, 10)
@@ -503,44 +502,27 @@ def objective(trial: optuna.Trial):
 
 
     # Alpha / 价心偏移
-    cfg.obiDepth = trial.suggest_int("obiDepth", 1, 10)
-    cfg.obiWeight = trial.suggest_float("obiWeight", 0.001, 5.0)
-    cfg.bpLookback = trial.suggest_int("bpLookback", 1, 100)
+    cfg.obiWeight = trial.suggest_float("obiWeight", 0.01, 5.0)
+    cfg.bpLookback = trial.suggest_int("bpLookback", 0.01, 10)
     cfg.bpWeight = trial.suggest_float("bpWeight", 0.001, 5.0)
-    cfg.micropriceWeight = trial.suggest_float("micropriceWeight", 0.0, 1.0)
-    cfg.alphaToPriceBps = trial.suggest_float("alphaToPriceBps", 0.1, 10.0)
+    cfg.micropriceWeight = trial.suggest_float("micropriceWeight", 0.01, 1.0)
+    cfg.alphaToPriceBps = trial.suggest_float("alphaToPriceBps", 0.01, 10.0)
 
     # 做市规模/订单管理
-    cfg.repriceThresholdBps = trial.suggest_float("repriceThresholdBps", 0.1, 5.0)
-    cfg.queueSizeAheadPctLimit = trial.suggest_float("queueSizeAheadPctLimit", 0.1, 0.9)
+    cfg.repriceThresholdBps = trial.suggest_float("repriceThresholdBps", 0.01, 10.0)
+    cfg.queueSizeAheadPctLimit = trial.suggest_float("queueSizeAheadPctLimit", 0.01, 10)
 
     # 设置用户属性以便后续分析
     for key, value in asdict(cfg).items():
         trial.set_user_attr(key, value)
 
-    returns, max_draw_down = test(cfg)
-    return returns, max_draw_down
+    stats = test(cfg)
+    return stats.splits[0]['Return'] * 1e4, stats.splits[0]['DailyNumberOfTrades'], -stats.splits[0]['MaxDrawdown'] * 1e4
 
 
 # 优化
-study = optuna.load_study(study_name="mm2",storage= "sqlite:///mm2.db")
+study = optuna.load_study(study_name="mm-custom-30m",storage= "mysql://optuna:AyHfbtAyAiRjR4ck@47.86.7.11/optuna")
 study.optimize(objective, n_trials=int(3 * 1e3), n_jobs=1)
 
-# ===== 取出 Top-100 并导出 =====
-trials = [t for t in study.get_trials(states=(TrialState.COMPLETE,)) if t.value is not None]
-trials_sorted = sorted(trials, key=lambda t: t.value, reverse=True)  # 因为是 maximize
-top100 = trials_sorted[:100]
-
-rows = []
-for i, t in enumerate(top100, 1):
-    row = {"rank": i, "trial": t.number, "score": t.value}
-    # 原始搜索维度（tick）
-    row.update({k: v for k, v in t.params.items()})
-    # 方便阅读的“换算后参数”（价格单位 & 比例）
-    row.update(t.user_attrs)
-    rows.append(row)
-
-df = pd.DataFrame(rows)
-print(df.head(10))
 
 
