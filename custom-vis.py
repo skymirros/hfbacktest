@@ -1,3 +1,4 @@
+#%%
 import time
 import numpy as np
 from numba import njit, uint64
@@ -18,6 +19,9 @@ from hftbacktest import (
 )
 from hftbacktest.stats import LinearAssetRecord
 import copy
+import pandas as pd
+
+#%%
 
 @dataclass
 class Config:
@@ -27,30 +31,30 @@ class Config:
     test_interval_ms: int = 2000  # 主循环节拍（≈ quoteRefreshMs）
 
     # 做市规模/订单管理
-    baseOrderQty: float = 10
-    maxOrdersPerSide: int = 2
-    repriceThresholdBps: float = 7.58
+    baseOrderQty: float = 1
+    maxOrdersPerSide: int = 1
+    repriceThresholdBps: float = 7.43
     cancelThrottleMs: int = 400
-    queueSizeAheadPctLimit: float = 6.0
+    queueSizeAheadPctLimit: float = 3.38
     queueBumpTicks: int = 1
 
     # Alpha / 价心偏移
     obiDepth: int = 5
-    obiWeight: float = 3.1
-    bpLookback: int = 4
-    bpWeight: float = 3.14
-    micropriceWeight: float = 0.10
-    alphaToPriceBps: float = 7.17
+    obiWeight: float = 0.59
+    bpLookback: int = 50
+    bpWeight: float = 3.9
+    micropriceWeight: float = 0.41
+    alphaToPriceBps: float = 4.14
 
     # AS 工业化参数
-    riskAversionGamma: float = 1.21
-    baseHalfSpreadBps: float = 4.4
-    volHalfSpreadK: float = 9.51
-    inventorySkewK: float = 9.61
+    riskAversionGamma: float = 0.5
+    baseHalfSpreadBps: float = 4
+    volHalfSpreadK: float = 3.6
+    inventorySkewK: float = 0.05
 
 
     # 波动率窗口（秒）
-    volLookbackSec: int = 420
+    volLookbackSec: int = 1800
 
     # 风控-以 quote 计
     targetInventoryQuote: float = 0
@@ -61,6 +65,8 @@ class Config:
     takerFee: float = 0.0007     # 示例费率：taker 付费
 
 CFG = Config()
+
+#%%
 
 @njit
 def floor_to_tick(px: float, tick: float) -> float:
@@ -203,12 +209,12 @@ def compute_quotes_AS(mid: float, depth, volScale: float,
                       centerShiftBps: float, skewAlpha: float,
                       invSkew: float,riskAversionGamma:float,baseHalfSpreadBps:float,volHalfSpreadK:float) -> Tuple[float, float, float]:
     # 中心
-    center = mid * (1.0 + centerShiftBps / 1e4 + (invSkew * riskAversionGamma) / 10.0)
+    center = mid * (1.0 + 0 / 1e4 + (invSkew * riskAversionGamma) / 10.0)
     halfBps = max(0.5, baseHalfSpreadBps + volHalfSpreadK * volScale)
     skewBps = 0.4 * halfBps * skewAlpha
     bid = center * (1.0 - (halfBps - skewBps) / 1e4)
     ask = center * (1.0 + (halfBps + skewBps) / 1e4)
-    return bid, ask, halfBps
+    return bid, ask, halfBps, center
 
 @njit
 def compute_quotes_GLFT(mid: float, depth, volScale: float, invSkew: float,cfg:Config) -> Tuple[float, float, float]:
@@ -220,6 +226,12 @@ def compute_quotes_GLFT(mid: float, depth, volScale: float, invSkew: float,cfg:C
     bid = center * (1.0 - halfBps / 1e4)
     ask = center * (1.0 + halfBps / 1e4)
     return bid, ask, halfBps
+
+#%%
+# 自定义可视化
+custom_vis_data = []
+#%%
+
 
 def strategy(hbt,stat,cfg:Config):
     asset_no = 0
@@ -301,8 +313,14 @@ def strategy(hbt,stat,cfg:Config):
 
     # 事件主循环：每 step_ns 检查一次
     while hbt.elapse(step_ns) == 0:
+        signal_vis_data = {}
+
         hbt.clear_inactive_orders(asset_no)
         ts = hbt.current_timestamp
+
+        signal_vis_data["timestamp"] = ts
+
+
 
         depth = hbt.depth(asset_no)
         best_bid = depth.best_bid
@@ -311,6 +329,7 @@ def strategy(hbt,stat,cfg:Config):
             continue
 
         mid = 0.5 * (best_bid + best_ask)
+        signal_vis_data["mid"] = mid
         push_mid(ts, mid)
 
         # 用 market trades 更新 1m bars（若无成交，以 mid 兜底）
@@ -326,6 +345,9 @@ def strategy(hbt,stat,cfg:Config):
         # 风控：净仓位（quote 计）= position * mid
         pos = hbt.position(asset_no)
         net_quote = pos * mid
+
+        signal_vis_data["pos"] = net_quote
+
 
         avg.push(net_quote)
 
@@ -353,13 +375,18 @@ def strategy(hbt,stat,cfg:Config):
         invSkew = -cfg.inventorySkewK * np.tanh(dev / max(1.0, cfg.maxNetPosQuote))
 
         # 计算目标价
+        center = 0
         if cfg.engine == "AS":
-            bid_raw, ask_raw, halfBps = compute_quotes_AS(mid, depth, vol_scale, centerShiftBps, skewAlpha, invSkew,riskAversionGamma=cfg.riskAversionGamma,baseHalfSpreadBps=cfg.baseHalfSpreadBps,volHalfSpreadK=cfg.volHalfSpreadK)
+            bid_raw, ask_raw, halfBps, center = compute_quotes_AS(mid, depth, vol_scale, centerShiftBps, skewAlpha, invSkew,riskAversionGamma=cfg.riskAversionGamma,baseHalfSpreadBps=cfg.baseHalfSpreadBps,volHalfSpreadK=cfg.volHalfSpreadK)
         else:
             bid_raw, ask_raw, halfBps = compute_quotes_GLFT(mid, depth, vol_scale, invSkew,cfg=cfg)
 
+        signal_vis_data['center'] = center
         bid = floor_to_tick(bid_raw, tick)
         ask = ceil_to_tick(ask_raw, tick)
+
+        signal_vis_data["bid"] = bid
+        signal_vis_data["ask"] = ask
 
         # 生成分层报价计划
         max_layers = max(1, cfg.maxOrdersPerSide)
@@ -463,18 +490,22 @@ def strategy(hbt,stat,cfg:Config):
                 hbt.submit_sell_order(asset_no, next_oid, px, qty, GTX, LIMIT, True)
             next_oid += 1
         stat.record(hbt)
+        custom_vis_data.append(signal_vis_data)
 
     return avg.mean
 
 
+#%%
+
 data = np.concatenate(
-[np.load('data\\binance_spot\\solfdusd_{}.npz'.format(date))['data'] for date in [20251011, 20251012, 20251013, 20251014, 20251015,]]
+[np.load('data/binance_spot/solfdusd_{}.npz'.format(date))['data'] for date in [20251014]]
 )
-initial_snapshot = np.load('data\\binance_spot\\solfdusd_20251010_eod.npz')['data']
+initial_snapshot = np.load('data/binance_spot/solfdusd_20251013_eod.npz')['data']
 latency_data = np.concatenate(
-[np.load('data\\binance_spot\\solfdusd_{}_latency.npz'.format(date))['data'] for date in [20251011, 20251012, 20251013, 20251014, 20251015,]]
+[np.load('data/binance_spot/solfdusd_{}_latency.npz'.format(date))['data'] for date in [20251014]]
 )
 
+#%%
 def test(cfg):
     roi_lb = 50
     roi_ub = 500
@@ -501,59 +532,52 @@ def test(cfg):
 
     qty_mean = strategy(hbt,recorder.recorder,cfg)
 
-
     hbt.close()
-    stats = LinearAssetRecord(recorder.get(0)).resample("1m").stats(book_size=10_000_000)
-    stats.plot().savefig("custom-3.png")
+    stats = LinearAssetRecord(recorder.get(0)).stats(book_size=10_000_000)
 
     return stats, qty_mean
+#%%
+stats, qty_mean = test(CFG)
+#%%
+#%%
+from datetime import datetime, timezone, timedelta
+from plotly.subplots import make_subplots
+import plotly.graph_objects as go
+
+x_dt = [
+    datetime.fromtimestamp(d['timestamp']/1e9, tz=timezone.utc).astimezone(timezone(timedelta(hours=9)))
+    for d in custom_vis_data
+]
+y_mid = [d['mid'] for d in custom_vis_data]
+y_center = [d['center'] for d in custom_vis_data]
+y_bid = [d['bid'] for d in custom_vis_data]
+y_ask = [d['ask'] for d in custom_vis_data]
+y_pos = [d['pos'] for d in custom_vis_data]
+
+fig = make_subplots(
+    rows=2, cols=1, shared_xaxes=True,
+    row_heights=[0.7, 0.3], vertical_spacing=0.04
+)
 
 
+fig.add_trace(go.Scatter(x=x_dt, y=y_mid, name="Line", line=dict(color="red", width=1)), row=1, col=1)
+fig.add_trace(go.Scatter(x=x_dt, y=y_center, name="Line", line=dict(color="black", width=1)), row=1, col=1)
+fig.add_trace(go.Scatter(x=x_dt, y=y_bid, name="Line", line=dict(color="blue", width=1)), row=1, col=1)
+fig.add_trace(go.Scatter(x=x_dt, y=y_ask, name="Line", line=dict(color="yellow", width=1)), row=1, col=1)
+
+fig.add_trace(go.Bar(x=x_dt, y=y_pos, name="Bar", marker=dict(color="blue",)), row=2, col=1)
+
+fig.update_layout(
+    showlegend=False,
+    paper_bgcolor="white",
+    plot_bgcolor="white",    # 绘图区背景
+    font=dict(color="black"),
 
 
-from dataclasses import asdict
-# pip install optuna numpy pandas
-import optuna, numpy as np, pandas as pd
-from optuna.trial import TrialState
-def objective(trial: optuna.Trial = None):
-    # 创建配置副本以避免修改原始配置
-    cfg = copy.deepcopy(CFG)
+)
+# 只在底部显示 X 轴标签/刻度（可选）
+fig.update_xaxes(title_text="X", row=2, col=1)
 
-    # 定义要优化的参数范围
-    # AS 工业化参数
-    cfg.baseHalfSpreadBps = trial.suggest_float("baseHalfSpreadBps", 0.1, 10.1,step=0.1)
-    cfg.riskAversionGamma = trial.suggest_float("riskAversionGamma", 0.01, 10.01,step=0.1)
-    cfg.volHalfSpreadK = trial.suggest_float("volHalfSpreadK", 0.01, 10.01,step=0.1)
-    cfg.inventorySkewK = trial.suggest_float("inventorySkewK", 0.01, 10.01,step=0.1)
+fig.show()
 
-
-
-    # Alpha / 价心偏移
-    cfg.obiWeight = trial.suggest_float("obiWeight", 0.001, 5.0,)
-    cfg.bpLookback = trial.suggest_int("bpLookback", 1, 10)
-    cfg.bpWeight = trial.suggest_float("bpWeight", 0.001, 5.0)
-    cfg.micropriceWeight = trial.suggest_float("micropriceWeight", 0.001, 1.0)
-    cfg.alphaToPriceBps = trial.suggest_float("alphaToPriceBps", 0.001, 10.0)
-
-    # 做市规模/订单管理
-    cfg.repriceThresholdBps = trial.suggest_float("repriceThresholdBps", 0.01, 10.0)
-    cfg.queueSizeAheadPctLimit = trial.suggest_float("queueSizeAheadPctLimit", 0.01, 10)
-
-    cfg.volLookbackSec = trial.suggest_int("volLookbackSec", 60, 3600,step=60)
-
-    # 设置用户属性以便后续分析
-    for key, value in asdict(cfg).items():
-        trial.set_user_attr(key, value)
-    try:
-        stats, qty_mean = test(cfg)
-    except Exception as e:
-        return -1e1,-1e5,-1e1
-    return stats.splits[0]['Return'] * 1e4, stats.splits[0]['DailyNumberOfTrades'],-abs(qty_mean), -stats.splits[0]['MaxDrawdown'] * 1e4
-
-
-# 优化
-study = optuna.load_study(study_name="mm-custom-30m-4",storage= "mysql://optuna:AyHfbtAyAiRjR4ck@47.86.7.11/optuna")
-study.optimize(objective, n_trials=int(3 * 1e3), n_jobs=1)
-
-
-
+print(stats.splits[0])
