@@ -1,3 +1,4 @@
+# %%
 import time
 import numpy as np
 from numba import njit, uint64
@@ -54,11 +55,11 @@ class Config:
 
     # 风控-以 quote 计
     targetInventoryQuote: float = 0
-    maxNetPosQuote: float = 5_00000.0
+    maxNetPosQuote: float = 5_0000.0
 
     # 其他
-    makerFee: float = -0.00005   # 示例费率：maker 返佣
-    takerFee: float = 0.0007     # 示例费率：taker 付费
+    makerFee: float = -0.5/1e4   # 示例费率：maker 返佣
+    takerFee: float = 3/1e4     # 示例费率：taker 付费
 
 CFG = Config()
 
@@ -468,11 +469,11 @@ def strategy(hbt,stat,cfg:Config):
 
 
 data = np.concatenate(
-[np.load('data\\binance_spot\\solfdusd_{}.npz'.format(date))['data'] for date in [20251011, 20251012, 20251013, 20251014, 20251015,]]
+[np.load('data/binance_spot/solusdt_{}.npz'.format(date))['data'] for date in [20251011, 20251012, 20251013, 20251014, 20251015]]
 )
-initial_snapshot = np.load('data\\binance_spot\\solfdusd_20251010_eod.npz')['data']
+initial_snapshot = np.load('data/binance_spot/solusdt_20251010_eod.npz')['data']
 latency_data = np.concatenate(
-[np.load('data\\binance_spot\\solfdusd_{}_latency.npz'.format(date))['data'] for date in [20251011, 20251012, 20251013, 20251014, 20251015,]]
+[np.load('data/binance_spot/solusdt_{}_latency.npz'.format(date))['data'] for date in [20251011, 20251012, 20251013, 20251014, 20251015]]
 )
 
 def test(cfg):
@@ -488,7 +489,7 @@ def test(cfg):
             .intp_order_latency(latency_data)
             .power_prob_queue_model(2)
             .no_partial_fill_exchange()
-            .trading_value_fee_model(0.0000, 0.0003)
+            .trading_value_fee_model(cfg.makerFee, cfg.takerFee)
             .tick_size(0.01)
             .lot_size(0.001)
             .roi_lb(roi_lb)
@@ -497,19 +498,31 @@ def test(cfg):
 
     hbt = ROIVectorMarketDepthBacktest([asset])
 
-    recorder = Recorder(1, 30_000_000)
+    recorder = Recorder(1, 100_000_000)
 
     qty_mean = strategy(hbt,recorder.recorder,cfg)
 
 
     hbt.close()
-    stats = LinearAssetRecord(recorder.get(0)).resample("1m").stats(book_size=10_000_000)
-    stats.plot().savefig("custom-3.png")
-
+    stats = LinearAssetRecord(recorder.get(0)).resample("60s").stats(book_size=10_000_000)
     return stats, qty_mean
 
+# %%
+# from dataclasses import asdict
 
+# new_config_dict =  {'baseHalfSpreadBps': 0.4, 'riskAversionGamma': 0.01, 'volHalfSpreadK': 3.21, 'inventorySkewK': 2.81, 'obiWeight': 4.06648255480038, 'bpLookback': 2, 'bpWeight': 1.687463593875685, 'micropriceWeight': 0.35075954077679666, 'alphaToPriceBps': 0.0644672240182356, 'repriceThresholdBps': 9.05545773545511, 'queueSizeAheadPctLimit': 9.034017908787192, 'volLookbackSec': 3120}
 
+# # 创建一个新的配置实例并更新其属性
+# for key, value in new_config_dict.items():
+#     if hasattr(CFG, key):
+#         setattr(CFG, key, value)
+
+# stats, _ = test(CFG)
+
+# %%
+# stats.plot()
+
+# %%
 
 from dataclasses import asdict
 # pip install optuna numpy pandas
@@ -522,7 +535,7 @@ def objective(trial: optuna.Trial = None):
     # 定义要优化的参数范围
     # AS 工业化参数
     cfg.baseHalfSpreadBps = trial.suggest_float("baseHalfSpreadBps", 0.1, 10.1,step=0.1)
-    cfg.riskAversionGamma = trial.suggest_float("riskAversionGamma", 0.01, 10.01,step=0.1)
+    cfg.riskAversionGamma = trial.suggest_float("riskAversionGamma", 0.001, 10.0,step=0.001)
     cfg.volHalfSpreadK = trial.suggest_float("volHalfSpreadK", 0.01, 10.01,step=0.1)
     cfg.inventorySkewK = trial.suggest_float("inventorySkewK", 0.01, 10.01,step=0.1)
 
@@ -552,8 +565,10 @@ def objective(trial: optuna.Trial = None):
 
 
 # 优化
-study = optuna.load_study(study_name="mm-custom-30m-4",storage= "mysql://optuna:AyHfbtAyAiRjR4ck@47.86.7.11/optuna")
+study = optuna.load_study(study_name="mm-custom-solusdt-No@1",storage= "mysql://optuna:AyHfbtAyAiRjR4ck@47.86.7.11/optuna")
 study.optimize(objective, n_trials=int(3 * 1e3), n_jobs=1)
+
+
 
 
 
