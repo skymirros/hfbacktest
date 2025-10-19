@@ -1,7 +1,16 @@
 import numpy as np
 
-from numba import njit, uint64
+from numba import njit, uint64,int64,float64
 from numba.typed import Dict
+from numba.experimental import jitclass
+
+
+# 定义类型规格
+spec = [
+    ('n', int64),
+    ('_sum', float64),
+    ('_comp', float64)
+]
 
 from hftbacktest import (
     BacktestAsset,
@@ -10,13 +19,34 @@ from hftbacktest import (
     LIMIT,
     BUY,
     SELL,
-    BUY_EVENT,
-    SELL_EVENT,
     Recorder
 )
 from hftbacktest.stats import LinearAssetRecord
 
 import pandas as pd
+
+@jitclass(spec)
+class StreamingMean:
+    """高精度流式平均值（Neumaier补偿求和，避免浮点误差累积）"""
+    def __init__(self):
+        self.n = 0
+        self._sum = 0.0
+        self._comp = 0.0  # 误差补偿
+
+    def push(self, x: float):
+        self.n += 1
+        t = self._sum + x
+        # Neumaier compensation
+        if abs(self._sum) >= abs(x):
+            self._comp += (self._sum - t) + x
+        else:
+            self._comp += (x - t) + self._sum
+        self._sum = t
+
+    @property
+    def mean(self) -> float:
+        return 0.0 if self.n == 0 else (self._sum + self._comp) / self.n
+
 
 @njit
 def obi_mm(
@@ -45,6 +75,9 @@ def obi_mm(
     roi_lb_tick = int(round(roi_lb / tick_size))
     roi_ub_tick = int(round(roi_ub / tick_size))
 
+
+    avg = StreamingMean()
+
     while hbt.elapse(interval) == 0:
         hbt.clear_inactive_orders(asset_no)
 
@@ -56,6 +89,8 @@ def obi_mm(
         best_ask = depth.best_ask
 
         mid_price = (best_bid + best_ask) / 2.0
+
+        avg.push(mid_price * position)
 
         sum_ask_qty = 0.0
         from_tick = max(depth.best_ask_tick, roi_lb_tick)
@@ -157,18 +192,20 @@ def obi_mm(
         # Records the current state for stat calculation.
         stat.record(hbt)
 
+    return avg.mean
+
 data = np.concatenate(
-[np.load('data\\binance_spot\\solfdusd_{}.npz'.format(date))['data'] for date in [20251011,20251012,20251013,20251014]]
+[np.load('C:/Users/81393/Desktop/code/hfbacktest/data/bitget_spot/{}/SPOT.ETHUSDT.npz'.format(date))['data'] for date in [20251019]]
 )
-initial_snapshot = np.load('data\\binance_spot\\solfdusd_20251010_eod.npz')['data']
+initial_snapshot = np.load('C:/Users/81393/Desktop/code/hfbacktest/data/bitget_spot/20251018/SPOT.ETHUSDT.eod.npz')['data']
 latency_data = np.concatenate(
-[np.load('data\\binance_spot\\solfdusd_{}_latency.npz'.format(date))['data'] for date in [20251011,20251012,20251013,20251014]]
+[np.load('C:/Users/81393/Desktop/code/hfbacktest/data/bitget_spot/{}/SPOT.ETHUSDT.latency.npz'.format(date))['data'] for date in [20251019]]
 )
 
 import optuna
 def objective(trial:optuna.Trial = None):
     roi_lb = 50
-    roi_ub = 500
+    roi_ub = 5000
     asset = (
         BacktestAsset()
         .data(data)
@@ -177,9 +214,9 @@ def objective(trial:optuna.Trial = None):
         .intp_order_latency(latency_data)
         .power_prob_queue_model(2)
         .no_partial_fill_exchange()
-        .trading_value_fee_model(0.00000, 0.0003)
+        .trading_value_fee_model(-0.8/1e4, 0.0003)
         .tick_size(0.01)
-        .lot_size(0.001)
+        .lot_size(0.0001)
         .roi_lb(roi_lb)
         .roi_ub(roi_ub)
     )
@@ -187,7 +224,7 @@ def objective(trial:optuna.Trial = None):
     hbt = ROIVectorMarketDepthBacktest([asset])
     recorder = Recorder(1, 30_000_000)
 
-    half_spread = 0.1
+    half_spread = 10
     skew = 0.538
     c1 = 0.2
     depth = 0.099  # 2.5% from the mid price
@@ -198,12 +235,14 @@ def objective(trial:optuna.Trial = None):
     grid_num = 1
     grid_interval = hbt.depth(0).tick_size
 
-    half_spread = trial.suggest_float("half_spread", 0.001, 1)
-    skew = trial.suggest_float("skew", 0.001, 1)
-    c1 = trial.suggest_float("c1", 0.01, 2)
-    depth = trial.suggest_float("depth", 1/1e4, 1/1e1)
+    if trial:
+        half_spread = trial.suggest_int("half_spread", 1, 50)
+        skew = trial.suggest_float("skew", 0.01, 10)
+        c1 = trial.suggest_int("c1", 1, 100)
+        depth = trial.suggest_float("depth", 1/1e4, 1/1e1)
+        window =  trial.suggest_int("window", 30 * interval, 60 * 60 * interval, step=30 * interval)
 
-    obi_mm(
+    avg = obi_mm(
         hbt,
         recorder.recorder,
         half_spread,
@@ -222,13 +261,19 @@ def objective(trial:optuna.Trial = None):
     hbt.close()
 
     stats = LinearAssetRecord(recorder.get(0)).stats(book_size=10_000_000)
+
+
     # 返回万分之
-    return stats.splits[0]['Return'] * 1e4, stats.splits[0]['DailyNumberOfTrades'], -stats.splits[0]['MaxDrawdown'] * 1e4
+    return stats.splits[0]['Return'] * 1e4, stats.splits[0]['DailyNumberOfTrades'] if  stats.splits[0]['DailyNumberOfTrades'] > abs(avg) else -stats.splits[0]['DailyNumberOfTrades'] , -abs(avg), -stats.splits[0]['MaxDrawdown'] * 1e4
 
 
 
 
-study = optuna.load_study(study_name="mm-obi-1m",storage= "mysql://optuna:AyHfbtAyAiRjR4ck@47.86.7.11/optuna")
+study = optuna.create_study(study_name="mm-obi-1m",storage= "sqlite:///mm-obi-1m.db", directions=["maximize","maximize","maximize","maximize"], load_if_exists=True, sampler=optuna.samplers.NSGAIIISampler(
+    population_size=80,        # ≈ 参考点数
+    dividing_parameter=8,      # H
+    seed=42,                   # 复现用
+))
 study.optimize(objective, n_trials=int(3 * 1e3), n_jobs=1)
 
 
