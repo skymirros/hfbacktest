@@ -99,8 +99,9 @@ def gridtrading_glft_mm(hbt, recorder, gamma = 0.05, delta = 1.0 ,adj1 = 1.0 ,ad
     volatility = np.nan
 
 
-    order_qty = 0.5
-    max_position = 200
+    order_qty = 0.1
+    soft_upper_limit = 10 # 持仓软上限
+    max_position = 15     # 持仓硬上限
     grid_num = 20
 
     avg = StreamingMean()
@@ -172,7 +173,7 @@ def gridtrading_glft_mm(hbt, recorder, gamma = 0.05, delta = 1.0 ,adj1 = 1.0 ,ad
         half_spread_tick = (c1 + delta / 2 * c2 * volatility) * adj1
         skew = c2 * volatility * adj2
 
-        reservation_price_tick = mid_price_tick - skew * position
+        reservation_price_tick = mid_price_tick * (1  - skew * np.tanh(position / soft_upper_limit))
 
         bid_price_tick = np.minimum(np.round(reservation_price_tick - half_spread_tick), best_bid_tick)
         ask_price_tick = np.maximum(np.round(reservation_price_tick + half_spread_tick), best_ask_tick)
@@ -251,12 +252,20 @@ from hftbacktest.stats import LinearAssetRecord
 from hftbacktest import Recorder, BacktestAsset, ROIVectorMarketDepthBacktest
 
 data = np.concatenate(
-[np.load('C:/Users/81393/Desktop/code/hfbacktest/data/bitget_spot/{}/SPOT.SOLUSDT.npz'.format(date))['data'] for date in [20251020, 20251021, 20251022]]
+[np.load('C:/Users/81393/Desktop/code/hfbacktest/data/binance_spot/solusdt_{}.npz'.format(date))['data'] for date in [20251011, 20251012, 20251013, 20251014, 20251015, 20251016, 20251017, 20251018,]]
 )
-initial_snapshot = np.load('C:/Users/81393/Desktop/code/hfbacktest/data/bitget_spot/20251019/SPOT.SOLUSDT.eod.npz')['data']
+initial_snapshot = np.load('C:/Users/81393/Desktop/code/hfbacktest/data/binance_spot/solusdt_20251010_eod.npz')['data']
 latency_data = np.concatenate(
-[np.load('C:/Users/81393/Desktop/code/hfbacktest/data/bitget_spot/{}/SPOT.SOLUSDT.latency.npz'.format(date))['data'] for date in [20251020, 20251021, 20251022]]
+[np.load('C:/Users/81393/Desktop/code/hfbacktest/data/binance_spot/solusdt_{}_latency.npz'.format(date))['data'] for date in [20251011, 20251012, 20251013, 20251014, 20251015, 20251016, 20251017, 20251018,]]
 )
+
+# data = np.concatenate(
+# [np.load('data/solusdt_{}.npz'.format(date))['data'] for date in [20251011, 20251012, 20251013, 20251014, 20251015, 20251016, 20251017, 20251018,]]
+# )
+# initial_snapshot = np.load('data/solusdt_20251010_eod.npz')['data']
+# latency_data = np.concatenate(
+# [np.load('data/solusdt_{}_latency.npz'.format(date))['data'] for date in [20251011, 20251012, 20251013, 20251014, 20251015, 20251016, 20251017, 20251018,]]
+# )
 
 asset = (
     BacktestAsset()
@@ -268,7 +277,7 @@ asset = (
         .no_partial_fill_exchange()
         .trading_value_fee_model(-0.5/1e4, 3/1e4)
         .tick_size(0.01)
-        .lot_size(0.0001)
+        .lot_size(0.001)
         .roi_lb(0.0)
         .roi_ub(500.0)
         .last_trades_capacity(10000)
@@ -284,8 +293,8 @@ def objective(trail:optuna.Trial| None = None):
         delta = trail.suggest_float('delta', 0.1, 10, step=0.1)
         adj1 = trail.suggest_float('adj1', 0.01, 10, step=0.01)
         adj2 = trail.suggest_float('adj2', 0.01, 1.0, step=0.01)
-        fit_window = trail.suggest_int('update_A_K_window', 100, 3000, step=100)
-        bins_for_fit = trail.suggest_int('bins_for_fit', 40, 120, step=10)
+        fit_window = trail.suggest_int('update_A_K_window', 60, 3600, step=60)
+        bins_for_fit = trail.suggest_int('bins_for_fit', 30, 120, step=10)
     else:
     # 1231 [0.17404209333333825, 13984.706214662881, 44265.853372434016, 1.717052732784075] {'gamma': 0.04, 'delta': 4.1, 'adj1': 0.1, 'adj2': 0.04, 'update_A_K_window': 1700, 'bins_for_fit': 60}
     # 26922 [0.14802678166655256, 7778.96604340188, 24660.457478005865, 3.227600182861747] {'gamma': 0.04, 'delta': 9.3, 'adj1': 0.1, 'adj2': 0.15000000000000002, 'update_A_K_window': 1300, 'bins_for_fit': 50}
@@ -297,7 +306,7 @@ def objective(trail:optuna.Trial| None = None):
         fit_window = 1700
         bins_for_fit = 60
     hbt = ROIVectorMarketDepthBacktest([asset])
-    recorder = Recorder(1, 5_000_000)
+    recorder = Recorder(1, 100_000_000)
     avg = gridtrading_glft_mm(hbt, recorder.recorder, gamma, delta, adj1, adj2, fit_window, bins_for_fit) 
 
     hbt.close()
@@ -307,15 +316,14 @@ def objective(trail:optuna.Trial| None = None):
     # return stats
 
 # %%
-study = optuna.create_study(study_name="mm-grid-glft-solusdt-bitget@No.7",
+import random
+
+
+study = optuna.create_study(study_name="mm-grid-glft-solusdt-binance@No.3",
                             directions=["maximize", "maximize", "maximize", "maximize"],
-                            sampler=optuna.samplers.NSGAIIISampler(
-    population_size=128,        # ≈ 参考点数
-    dividing_parameter=8,      # H
-    seed=42,                   # 复现用
-),
+                           sampler=optuna.samplers.TPESampler(seed=random.randint(1,100)),
                             storage="mysql://optuna:AyHfbtAyAiRjR4ck@47.86.7.11/optuna",
                             load_if_exists=True)
-study.optimize(objective, n_trials=int(3 * 1e3), n_jobs=1)
+study.optimize(objective, n_trials=int(5 * 1e3), n_jobs=1)
 
 
