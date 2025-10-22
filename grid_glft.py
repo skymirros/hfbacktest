@@ -307,9 +307,13 @@ def objective(trail:optuna.Trial| None = None):
     # return stats
 
 # %%
-study = optuna.create_study(study_name="mm-grid-glft-solusdt-bitget@No.6",
+study = optuna.create_study(study_name="mm-grid-glft-solusdt-bitget@No.7",
                             directions=["maximize", "maximize", "maximize", "maximize"],
-                            sampler=optuna.samplers.TPESampler(seed=42),
+                            sampler=optuna.samplers.NSGAIIISampler(
+    population_size=128,        # ≈ 参考点数
+    dividing_parameter=8,      # H
+    seed=42,                   # 复现用
+),
                             storage="mysql://optuna:AyHfbtAyAiRjR4ck@47.86.7.11/optuna",
                             load_if_exists=True)
 study.optimize(objective, n_trials=int(3 * 1e3), n_jobs=1)
