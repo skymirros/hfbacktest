@@ -1,9 +1,4 @@
-# -*- coding: utf-8 -*-
 """
-GLFT 做市商 - 最终修正版本
-----------------------------------------------------------------------------
-采纳两条关键建议：
-
 1. 价差计算：使用 δ_bid + δ_ask 作为实际价差，理论价差作为参考
 2. 库存归一化：显式处理 Δq，确保量纲一致性
 """
@@ -82,11 +77,6 @@ class GLFTAsymptoticMarketMaker:
         # 价差计算修正：使用实际报价之和
         actual_spread = delta_bid + delta_ask
         
-        # 对称参数下的理论价差（仅作参考）
-        k_avg = (k_bid_t + k_ask_t) / 2
-        A_avg = (A_bid + A_ask) / 2
-        theoretical_spread = (2.0 / self.p.gamma_t) * math.log(1.0 + self.p.gamma_t / k_avg)
-        theoretical_spread += self._compute_common_risk_factor(A_avg, k_avg)
         
         return {
             # 核心输出
@@ -94,7 +84,6 @@ class GLFTAsymptoticMarketMaker:
             "delta_ask": delta_ask, 
             "actual_spread": actual_spread,      # 主要使用的价差
             # 参考信息
-            "theoretical_spread": theoretical_spread,  # 对称理论值
             "normalized_inventory": i,
             # 诊断信息
             "C_bid": C_bid, "C_ask": C_ask,
@@ -121,9 +110,6 @@ def demonstrate_spread_calculation():
     print(f"Bid侧: A=0.5, k=0.2 → δ_bid = {result['delta_bid']:.4f}")
     print(f"Ask侧: A=1.5, k=0.4 → δ_ask = {result['delta_ask']:.4f}")
     print(f"实际价差 (δ_bid + δ_ask): {result['actual_spread']:.4f}")
-    print(f"理论价差 (对称近似): {result['theoretical_spread']:.4f}")
-    print(f"差异: {result['actual_spread'] - result['theoretical_spread']:.4f}")
-    print("\n结论：非对称情况下，实际价差与理论价差存在显著差异")
 
 
 if __name__ == "__main__":
